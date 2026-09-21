@@ -1455,11 +1455,28 @@ pub struct NewsletterLiveUpdate {
 }
 
 /// A single message entry in a newsletter live update.
+///
+/// A live update is counters only: the server sends `<message server_id="…">`
+/// with no body, no timestamp and no type, so the message it refers to has to
+/// be correlated by `server_id` against history the caller already has.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterLiveUpdateMessage {
     pub server_id: u64,
     pub reactions: Vec<NewsletterLiveUpdateReaction>,
+    /// Per-option vote tallies, sent while a channel poll is being voted on.
+    /// This is the only way to follow a channel poll in real time.
+    #[builder(default)]
+    pub votes: Vec<NewsletterLiveUpdatePollVote>,
+    /// How many times the message was forwarded. `None` when the update
+    /// carried no counter; the server omits the node rather than sending zero.
+    pub forwards_count: Option<u64>,
+    /// How many times the message was viewed. Modelled from the IQ contract;
+    /// not observed in a capture taken as a plain follower.
+    pub views_count: Option<u64>,
+    /// How many responses a channel question collected. Same caveat as
+    /// [`views_count`](Self::views_count).
+    pub responses_count: Option<u64>,
 }
 
 /// A reaction count in a newsletter live update.
@@ -1467,6 +1484,16 @@ pub struct NewsletterLiveUpdateMessage {
 #[non_exhaustive]
 pub struct NewsletterLiveUpdateReaction {
     pub code: String,
+    pub count: u64,
+}
+
+/// A poll option's vote tally in a newsletter live update.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct NewsletterLiveUpdatePollVote {
+    /// SHA-256 of the option name, as
+    /// [`crate::poll::compute_option_hash`] computes it.
+    pub option_hash: [u8; 32],
     pub count: u64,
 }
 

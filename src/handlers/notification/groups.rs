@@ -386,24 +386,34 @@ fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
         .detach();
 }
 
-/// Handle `<notification type="newsletter">` — live updates with reaction counts.
+/// Handle `<notification type="newsletter">` — live updates with the counters
+/// that moved.
 ///
 /// Format:
 /// ```xml
 /// <notification from="NL_JID" type="newsletter" id="..." t="...">
 ///   <live_updates>
-///     <messages jid="NL_JID" t="...">
-///       <message server_id="123" ...>
+///     <messages t="...">
+///       <message server_id="123">
+///         <forwards_count count="12"/>
+///         <votes><vote count="7">…32-byte option hash…</vote></votes>
 ///         <reactions><reaction code="👍" count="3"/></reactions>
 ///       </message>
 ///     </messages>
 ///   </live_updates>
 /// </notification>
 /// ```
+///
+/// Two shapes differ from message history and are easy to get wrong: the
+/// `<messages>` node here carries no `jid` (the channel is the notification's
+/// `from`), and `<message>` carries only `server_id` — no `id`, no `t`, no
+/// `type`, and never a `<plaintext>`. An update is a delta of counters, so the
+/// message it belongs to has to be correlated by `server_id`.
 pub(crate) fn handle_newsletter_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
-    use crate::features::newsletter::parse_reaction_counts;
+    use crate::features::newsletter::{parse_count_child, parse_poll_votes, parse_reaction_counts};
     use wacore::types::events::{
-        NewsletterLiveUpdate, NewsletterLiveUpdateMessage, NewsletterLiveUpdateReaction,
+        NewsletterLiveUpdate, NewsletterLiveUpdateMessage, NewsletterLiveUpdatePollVote,
+        NewsletterLiveUpdateReaction,
     };
 
     let nr = node.get();
@@ -435,10 +445,24 @@ pub(crate) fn handle_newsletter_notification(client: &Arc<Client>, node: Arc<Own
                     })
                     .collect();
 
+                let votes = parse_poll_votes(msg_node)
+                    .into_iter()
+                    .map(|v| {
+                        NewsletterLiveUpdatePollVote::builder()
+                            .option_hash(v.option_hash)
+                            .count(v.count)
+                            .build()
+                    })
+                    .collect();
+
                 Some(
                     NewsletterLiveUpdateMessage::builder()
                         .server_id(server_id)
                         .reactions(reactions)
+                        .votes(votes)
+                        .maybe_forwards_count(parse_count_child(msg_node, "forwards_count"))
+                        .maybe_views_count(parse_count_child(msg_node, "views_count"))
+                        .maybe_responses_count(parse_count_child(msg_node, "responses_count"))
                         .build(),
                 )
             })
@@ -825,5 +849,77 @@ mod tests {
             transport.sent().is_empty(),
             "an up-to-date server_sync must not reach the wire"
         );
+    }
+
+    /// A live update is a delta of counters, and reactions are only one of
+    /// them: the same `<message>` carries the forward counter and, while a
+    /// channel poll is open, its per-option tallies. Dispatching only the
+    /// reactions makes a running poll invisible to a subscriber.
+    #[tokio::test]
+    async fn a_live_update_dispatches_every_counter_it_carries() {
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let option_hash = wacore::poll::compute_option_hash("Option A");
+        // No jid on <messages>, and no id/t/type on <message>: the live-update
+        // shape differs from history on both counts.
+        let node = NodeBuilder::new("notification")
+            .attr("type", "newsletter")
+            .attr("from", "111222333444555666@newsletter")
+            .attr("id", "live-update-1")
+            .attr("t", "1700000000")
+            .children([NodeBuilder::new("live_updates")
+                .children([NodeBuilder::new("messages")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("message")
+                        .attr("server_id", "907")
+                        .children([
+                            NodeBuilder::new("forwards_count")
+                                .attr("count", "12")
+                                .build(),
+                            NodeBuilder::new("votes")
+                                .children([NodeBuilder::new("vote")
+                                    .attr("count", "7")
+                                    .bytes(option_hash.to_vec())
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("reactions")
+                                .children([NodeBuilder::new("reaction")
+                                    .attr("code", "👍")
+                                    .attr("count", "5")
+                                    .build()])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        handle_newsletter_notification(&client, crate::test_utils::node_to_owned_ref(&node));
+
+        let mut update = None;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::NewsletterLiveUpdate(u) = &*event {
+                update = Some(u.clone());
+            }
+        }
+        let update = update.expect("the notification must dispatch a live update");
+
+        assert_eq!(
+            update.newsletter_jid.to_string(),
+            "111222333444555666@newsletter"
+        );
+        let msg = &update.messages[0];
+        assert_eq!(msg.server_id, 907);
+        assert_eq!(msg.forwards_count, Some(12));
+        assert_eq!(msg.views_count, None);
+        assert_eq!(msg.responses_count, None);
+        assert_eq!(msg.votes.len(), 1);
+        assert_eq!(msg.votes[0].option_hash, option_hash);
+        assert_eq!(msg.votes[0].count, 7);
+        assert_eq!(msg.reactions.len(), 1);
     }
 }
