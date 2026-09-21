@@ -2165,4 +2165,325 @@ mod tests {
         let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
         assert!(msgs.is_empty());
     }
+
+    // ── Happy path ────────────────────────────────────────────────────────
+
+    /// A page of history is parsed message by message, and nothing leaks
+    /// sideways: each message keeps its own counters, its own poll stage and
+    /// its own profile. A parser that hoisted a child lookup out of the loop
+    /// would still pass every single-message test above.
+    #[test]
+    fn a_page_of_history_keeps_each_message_to_its_own_fields() {
+        let hash = wacore::poll::compute_option_hash("Yes");
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "10")
+                .attr("id", "FICTIONALMSGID10")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([
+                    NodeBuilder::new("forwards_count")
+                        .attr("count", "4")
+                        .build(),
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
+                ])
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "11")
+                .attr("id", "FICTIONALMSGID11")
+                .attr("t", "1700000100")
+                .attr("type", "poll")
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("polltype", "creation")
+                        .build(),
+                    NodeBuilder::new("votes")
+                        .children([NodeBuilder::new("vote")
+                            .attr("count", "2")
+                            .bytes(hash.to_vec())
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
+                ])
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "12")
+                .attr("id", "FICTIONALMSGID12")
+                .attr("t", "1700000200")
+                .attr("type", "media")
+                .children([NodeBuilder::new("plaintext")
+                    .attr("mediatype", "gif")
+                    .bytes(Vec::new())
+                    .build()])
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs.iter().map(|m| m.server_id).collect::<Vec<_>>(),
+            vec![10, 11, 12],
+            "history keeps the server's order; pagination cursors depend on it"
+        );
+
+        assert_eq!(msgs[0].forwards_count, Some(4));
+        assert!(msgs[0].votes.is_empty());
+        assert_eq!(msgs[0].poll_type, None);
+
+        assert_eq!(msgs[1].forwards_count, None);
+        assert_eq!(msgs[1].poll_type, Some(PollType::Creation));
+        assert_eq!(msgs[1].votes.len(), 1);
+
+        assert_eq!(msgs[2].media_type.as_deref(), Some("gif"));
+        assert!(msgs[2].votes.is_empty());
+        assert_eq!(msgs[2].forwards_count, None);
+    }
+
+    /// `<views_count>` has two shapes upstream, the plain one whatsmeow reads
+    /// and a newer one tagged `type="views"`. Both put the number in the same
+    /// attribute, and both have to read.
+    #[test]
+    fn views_count_reads_in_both_wire_shapes() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "20")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([NodeBuilder::new("views_count").attr("count", "321").build()])
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "21")
+                .attr("t", "1700000100")
+                .attr("type", "text")
+                .children([NodeBuilder::new("views_count")
+                    .attr("type", "views")
+                    .attr("count", "654")
+                    .build()])
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs[0].views_count, Some(321));
+        assert_eq!(msgs[1].views_count, Some(654));
+    }
+
+    // ── Unhappy path ──────────────────────────────────────────────────────
+
+    /// `server_id` is what pagination and reactions key on, so a message
+    /// without a usable one is skipped rather than given a made-up id. The
+    /// well-formed messages around it still come through.
+    #[test]
+    fn a_message_without_a_usable_server_id_is_skipped() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "not-a-number")
+                .attr("t", "1700000100")
+                .attr("type", "text")
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "30")
+                .attr("t", "1700000200")
+                .attr("type", "text")
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].server_id, 30);
+    }
+
+    /// An IQ result with no `<messages>` child is a protocol error, not an
+    /// empty page: reporting it as zero messages would read as "this channel
+    /// has no history" and stop a pagination loop early.
+    #[test]
+    fn a_response_without_a_messages_node_is_an_error() {
+        let response = NodeBuilder::new("iq").attr("type", "result").build();
+
+        assert!(matches!(
+            parse_newsletter_messages_response(&response.as_node_ref()),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    /// A counter whose `count` is not a number reads as absent. The node is
+    /// there but says nothing usable, and inventing a zero would claim the
+    /// message was never forwarded.
+    #[test]
+    fn a_counter_with_an_unparsable_count_reads_as_absent() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "40")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([
+                    NodeBuilder::new("forwards_count")
+                        .attr("count", "many")
+                        .build(),
+                    NodeBuilder::new("views_count").build(),
+                ])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+        assert_eq!(msg.forwards_count, None);
+        assert_eq!(msg.views_count, None);
+    }
+
+    // ── Regression ────────────────────────────────────────────────────────
+
+    /// The parser must not depend on the order the children arrive in.
+    ///
+    /// The server sends them in a stable order (`forwards_count`, `rcat`,
+    /// `meta`, `votes`, `reactions`, `plaintext`), which is exactly the kind
+    /// of incidental regularity a reader starts relying on by accident. This
+    /// builds the same message backwards.
+    #[test]
+    fn regression_child_order_does_not_change_what_is_read() {
+        let hash = wacore::poll::compute_option_hash("Yes");
+        let children_forward = [
+            NodeBuilder::new("forwards_count")
+                .attr("count", "9")
+                .build(),
+            NodeBuilder::new("meta")
+                .attr("polltype", "creation")
+                .build(),
+            NodeBuilder::new("votes")
+                .children([NodeBuilder::new("vote")
+                    .attr("count", "3")
+                    .bytes(hash.to_vec())
+                    .build()])
+                .build(),
+            NodeBuilder::new("reactions")
+                .children([NodeBuilder::new("reaction")
+                    .attr("code", "👍")
+                    .attr("count", "1")
+                    .build()])
+                .build(),
+            NodeBuilder::new("plaintext")
+                .attr("mediatype", "image")
+                .bytes(Vec::new())
+                .build(),
+        ];
+        let mut children_reversed = children_forward.clone();
+        children_reversed.reverse();
+
+        let parse = |children: [wacore_binary::Node; 5]| {
+            let response = history_response(vec![
+                NodeBuilder::new("message")
+                    .attr("server_id", "50")
+                    .attr("t", "1700000000")
+                    .attr("type", "poll")
+                    .children(children)
+                    .build(),
+            ]);
+            let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+            let msg = &msgs[0];
+            (
+                msg.forwards_count,
+                msg.poll_type,
+                msg.votes.clone(),
+                msg.reactions.len(),
+                msg.media_type.clone(),
+            )
+        };
+
+        assert_eq!(parse(children_forward), parse(children_reversed));
+    }
+
+    /// An unrecognized child must not cost the children we do know.
+    ///
+    /// WhatsApp adds counters to this stanza over time — `forwards_count` is
+    /// itself recent enough that whatsmeow does not read it — so the next one
+    /// will arrive as a sibling nobody here has heard of. It has to be
+    /// ignorable, and the message has to survive it.
+    #[test]
+    fn regression_an_unknown_child_does_not_cost_the_known_ones() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "60")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([
+                    NodeBuilder::new("shares_count").attr("count", "5").build(),
+                    NodeBuilder::new("forwards_count")
+                        .attr("count", "7")
+                        .build(),
+                    NodeBuilder::new("reactions")
+                        .children([NodeBuilder::new("reaction")
+                            .attr("code", "❤")
+                            .attr("count", "2")
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
+                ])
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs.len(), 1, "an unknown child must not drop the message");
+        assert_eq!(msgs[0].forwards_count, Some(7));
+        assert_eq!(msgs[0].reactions.len(), 1);
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────
+
+    /// A count of zero is a fact, not an absence.
+    ///
+    /// The server omits the node instead of sending `count="0"` (no zero
+    /// appears in a capture of 267 messages), so this shape is unobserved —
+    /// which is precisely why the distinction has to be pinned: if it ever
+    /// does arrive, `Some(0)` must not collapse into `None`.
+    #[test]
+    fn a_zero_count_is_kept_apart_from_an_absent_one() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "70")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([NodeBuilder::new("forwards_count")
+                    .attr("count", "0")
+                    .build()])
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "71")
+                .attr("t", "1700000100")
+                .attr("type", "text")
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs[0].forwards_count, Some(0));
+        assert_eq!(msgs[1].forwards_count, None);
+    }
+
+    /// A `type` this build does not model is kept verbatim instead of being
+    /// forced into `Text`, and it does not enable the poll-only reads.
+    #[test]
+    fn an_unmodelled_message_type_is_kept_verbatim() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "80")
+                .attr("t", "1700000000")
+                .attr("type", "hologram")
+                .children([NodeBuilder::new("meta")
+                    .attr("polltype", "creation")
+                    .build()])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+        assert_eq!(
+            msg.message_type,
+            NewsletterMessageType::Other("hologram".to_string())
+        );
+        assert_eq!(
+            msg.poll_type, None,
+            "the poll stage is read for poll envelopes only"
+        );
+    }
 }

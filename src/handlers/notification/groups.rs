@@ -922,4 +922,102 @@ mod tests {
         assert_eq!(msg.votes[0].count, 7);
         assert_eq!(msg.reactions.len(), 1);
     }
+
+    /// An update that moved no reaction still carries news.
+    ///
+    /// Regression for the shape this handler used to assume: it read
+    /// `<reactions>` and nothing else, so an update whose only change was the
+    /// forward counter reached subscribers as a message with an empty
+    /// reaction list — an event that says a message changed and not what.
+    #[tokio::test]
+    async fn a_live_update_with_no_reactions_still_reports_the_counter() {
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "newsletter")
+            .attr("from", "111222333444555666@newsletter")
+            .attr("id", "live-update-2")
+            .attr("t", "1700000000")
+            .children([NodeBuilder::new("live_updates")
+                .children([NodeBuilder::new("messages")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("message")
+                        .attr("server_id", "908")
+                        .children([NodeBuilder::new("forwards_count")
+                            .attr("count", "3")
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        handle_newsletter_notification(&client, crate::test_utils::node_to_owned_ref(&node));
+
+        let mut update = None;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::NewsletterLiveUpdate(u) = &*event {
+                update = Some(u.clone());
+            }
+        }
+        let update = update.expect("a counter-only update is still an update");
+
+        let msg = &update.messages[0];
+        assert_eq!(msg.server_id, 908);
+        assert_eq!(msg.forwards_count, Some(3));
+        assert!(msg.reactions.is_empty());
+        assert!(msg.votes.is_empty());
+    }
+
+    /// A `<live_updates>` burst with nothing usable in it must not reach
+    /// subscribers as an empty update.
+    ///
+    /// Edge case rather than an observed shape: a message with no `server_id`
+    /// cannot be correlated with anything, so an event built from it would
+    /// wake every subscriber to say nothing.
+    #[tokio::test]
+    async fn a_live_update_with_no_correlatable_message_dispatches_nothing() {
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "newsletter")
+            .attr("from", "111222333444555666@newsletter")
+            .attr("id", "live-update-3")
+            .attr("t", "1700000000")
+            .children([NodeBuilder::new("live_updates")
+                .children([NodeBuilder::new("messages")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("message")
+                        .children([NodeBuilder::new("forwards_count")
+                            .attr("count", "3")
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        handle_newsletter_notification(&client, crate::test_utils::node_to_owned_ref(&node));
+
+        let mut live_updates = 0;
+        let mut notifications = 0;
+        while let Ok(event) = rx.try_recv() {
+            match &*event {
+                Event::NewsletterLiveUpdate(_) => live_updates += 1,
+                Event::Notification(_) => notifications += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(live_updates, 0, "nothing correlatable, nothing to dispatch");
+        assert_eq!(
+            notifications, 1,
+            "the raw notification still reaches subscribers that want it"
+        );
+    }
 }
