@@ -18,6 +18,7 @@ use wacore::iq::mex_operations::{
 };
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
+use wacore::types::message::{EditAttribute, PollType};
 use wacore_binary::Jid;
 use wacore_binary::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
@@ -65,6 +66,24 @@ impl NewsletterError {
 
 // Types
 
+/// The `type` attribute of a `<message>` in a newsletter's history.
+///
+/// Only [`Text`](Self::Text), [`Media`](Self::Media) and [`Poll`](Self::Poll)
+/// occur on the wire: WA Web's history parser discriminates on those three,
+/// and a capture of 267 history messages across 9 channels carried nothing
+/// else. What the other variants try to name lives in sibling fields instead,
+/// and matching on them will never fire:
+///
+/// - an edit is `edit="3"` and a revocation `edit="8"`, both read into
+///   [`NewsletterMessage::edit`];
+/// - a poll's stage is `<meta polltype>`, read into
+///   [`NewsletterMessage::poll_type`], which is where the `creation` /
+///   `quiz_creation` / `result_snapshot` distinction actually lives;
+/// - a reaction is never a message type here: reactions arrive as counts on
+///   the message they apply to ([`NewsletterMessage::reactions`]).
+///
+/// They are kept because removing a variant breaks callers that match on it;
+/// prefer the fields above.
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum NewsletterMessageType {
@@ -72,14 +91,25 @@ pub enum NewsletterMessageType {
     Text,
     #[wire = "media"]
     Media,
+    /// A poll, quiz, or poll result snapshot. Which of the three is in
+    /// [`NewsletterMessage::poll_type`].
+    #[wire = "poll"]
+    Poll,
+    /// Never produced by the wire; see the type-level docs.
     #[wire = "reaction"]
     Reaction,
+    /// Never produced by the wire; a revocation is `edit="8"`.
     #[wire = "revoke"]
     Revoke,
+    /// Never produced by the wire; use [`Poll`](Self::Poll) plus
+    /// [`NewsletterMessage::poll_type`].
     #[wire = "poll_creation"]
     PollCreation,
+    /// Never produced by the wire; a channel poll's votes are counts on the
+    /// poll message ([`NewsletterMessage::votes`]).
     #[wire = "poll_vote"]
     PollVote,
+    /// Never produced by the wire; an edit is `edit="3"`.
     #[wire = "edit"]
     Edit,
     #[wire_fallback]
@@ -178,8 +208,31 @@ pub struct NewsletterReactionCount {
     pub count: u64,
 }
 
+/// A poll option's vote tally on a newsletter message.
+///
+/// Channel polls are counted server-side, so unlike a DM or group vote (which
+/// arrives encrypted, see [`wacore::poll`]) there is nothing to decrypt here:
+/// the server hands over the totals directly, keyed by option hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewsletterPollVote {
+    /// SHA-256 of the option name, the same digest
+    /// [`wacore::poll::compute_option_hash`] produces. Match it against the
+    /// options of the `pollCreationMessage` in
+    /// [`NewsletterMessage::message`] to recover which option was voted for.
+    pub option_hash: [u8; 32],
+    /// How many followers picked this option.
+    pub count: u64,
+}
+
 /// A message from a newsletter's history.
+///
+/// `#[non_exhaustive]` because the server keeps adding children to
+/// `<message>`: construct it from a parsed response rather than by struct
+/// literal, so the next counter WhatsApp ships is an added field and not a
+/// break.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NewsletterMessage {
     /// Wire message id (the stanza `id`). This is what edit_message / revoke_message
     /// key on (NOT `server_id`). Empty if the server omitted it.
@@ -188,14 +241,80 @@ pub struct NewsletterMessage {
     pub server_id: u64,
     /// Message timestamp (Unix seconds).
     pub timestamp: u64,
-    /// Message type (text, media, reaction, etc.).
+    /// Message type: `text`, `media` or `poll`. An edit or a revocation is not
+    /// a type of its own, see [`edit`](Self::edit).
     pub message_type: NewsletterMessageType,
+    /// The `edit` attribute: [`EditAttribute::AdminEdit`] (`3`) for an edited
+    /// message, [`EditAttribute::AdminRevoke`] (`8`) for a revoked one.
+    /// [`EditAttribute::Empty`] when the attribute is absent, which is the
+    /// common case.
+    ///
+    /// A revoked message keeps its envelope and loses its body: the server
+    /// sends an empty `<plaintext/>`, drops the forward counter, and
+    /// [`message`](Self::message) is `None`.
+    pub edit: EditAttribute,
     /// Whether the viewer is the sender.
     pub is_sender: bool,
-    /// Decoded protobuf message (from `<plaintext>` bytes).
+    /// Decoded protobuf message (from `<plaintext>` bytes). `None` when the
+    /// server sent no body, as it does for a revocation.
     pub message: Option<wa::Message>,
+    /// The `mediatype` attribute of `<plaintext>` — `image`, `video`, `gif`,
+    /// `url` and so on. A hint about the payload that is readable without
+    /// decoding it.
+    ///
+    /// Left untyped on purpose: the bundle names this enum synthetically, so
+    /// the codegen does not bind it and a hand-written twin would drift.
+    pub media_type: Option<String>,
     /// Reaction counts on this message.
     pub reactions: Vec<NewsletterReactionCount>,
+    /// Per-option vote tallies, for a `poll` message.
+    pub votes: Vec<NewsletterPollVote>,
+    /// How many times the message was forwarded.
+    ///
+    /// `None` means the server sent no counter at all — it omits the node
+    /// rather than sending a zero, so `Some(0)` is not what an unforwarded
+    /// message looks like.
+    pub forwards_count: Option<u64>,
+    /// How many times the message was viewed.
+    ///
+    /// Modelled from the IQ contract and from whatsmeow, which reads it; a
+    /// capture of 267 history messages across 9 channels, taken as a plain
+    /// follower, never carried one. Expect `None` unless the viewer's role in
+    /// the channel entitles them to view counts.
+    pub views_count: Option<u64>,
+    /// How many responses a channel question collected. Same caveat as
+    /// [`views_count`](Self::views_count): contract-derived, not observed.
+    pub responses_count: Option<u64>,
+    /// `<meta original_msg_t>` (Unix **seconds**): when the message was first
+    /// posted, as opposed to [`timestamp`](Self::timestamp), which moves with
+    /// an edit.
+    pub original_timestamp: Option<u64>,
+    /// `<meta msg_edit_t>` (Unix **milliseconds**, unlike every other
+    /// timestamp on this struct): when the message was last edited.
+    pub last_edit_timestamp_ms: Option<u64>,
+    /// `<meta polltype>`: which stage of a poll's lifecycle this message is.
+    ///
+    /// Read only when [`message_type`](Self::message_type) is
+    /// [`NewsletterMessageType::Poll`], the same scoping WA Web applies, so a
+    /// `polltype` on anything else is ignored rather than recorded.
+    pub poll_type: Option<PollType>,
+    /// `<meta contenttype>`.
+    pub content_type: Option<String>,
+    /// `<meta questiontype>`: `question` for a channel question, `reply` for an
+    /// admin's reply to one.
+    pub question_type: Option<String>,
+    /// `<meta message_association_type>`: how this media relates to another
+    /// message (`media_poll`, `motion_photo`, `poll_add_option`, …).
+    pub message_association_type: Option<String>,
+    /// `<meta is_wamo_sub="true">`.
+    pub is_wamo_sub: bool,
+    /// `<meta><admin_profile>`: the publishing admin's public profile, on
+    /// channels that enabled admin profiles.
+    pub admin_profile: Option<NewsletterAdminProfile>,
+    /// `<rcat>` content bytes, an opaque receiver-side token the server
+    /// attaches to some link previews (`mediatype="url"`). Carried verbatim;
+    /// this client does not interpret it.
+    pub rcat: Option<Vec<u8>>,
 }
 
 /// Feature handle for newsletter (channel) operations.
@@ -567,11 +686,15 @@ impl<'a> Newsletter<'a> {
 
     // ─── Live updates ───────────────────────────────────────────────────
 
-    /// Subscribe to live updates for a newsletter (reaction counts, message changes).
+    /// Subscribe to live updates for a newsletter: reaction counts, forward
+    /// counts and poll tallies as they move.
     ///
     /// The server will send `<notification type="newsletter">` stanzas with
     /// `<live_updates>` children, dispatched as `Event::NewsletterLiveUpdate`.
-    /// Returns the subscription duration in seconds.
+    /// Returns the subscription duration in seconds, after which it has to be
+    /// renewed. The server sets this; 90 seconds is what it answered in a real
+    /// session, and the 300 below is only the fallback for a response that
+    /// omits the attribute entirely.
     pub async fn subscribe_live_updates(
         &self,
         jid: impl Into<Jid>,
@@ -904,19 +1027,77 @@ pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactio
     reactions
 }
 
+/// Parse per-option tallies from a `<votes>` node.
+///
+/// Not gated on the message's `type`: a live update carries `<votes>` on a
+/// bare `<message server_id="…">` with no type attribute at all, so gating
+/// here would drop exactly the updates a running poll produces.
+///
+/// A `<vote>` whose content is not a 32-byte digest is skipped rather than
+/// truncated or padded — the hash is the only handle on which option was
+/// voted for, and a wrong one silently attributes votes to the wrong option.
+pub(crate) fn parse_poll_votes(node: &NodeRef<'_>) -> Vec<NewsletterPollVote> {
+    let mut votes = Vec::new();
+    if let Some(votes_node) = node.get_optional_child("votes")
+        && let Some(children) = votes_node.children()
+    {
+        for v in children.iter().filter(|n| n.tag.as_ref() == "vote") {
+            let Some(option_hash) = v
+                .content_bytes()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            else {
+                continue;
+            };
+            let count = v.attrs().optional_u64("count").unwrap_or(0);
+            votes.push(NewsletterPollVote { option_hash, count });
+        }
+    }
+    votes
+}
+
+/// Read a `<tag count="N"/>` child, the shape `<forwards_count>`,
+/// `<views_count>` and `<responses_count>` share.
+///
+/// `<views_count>` has a second form upstream, `<views_count type="views"
+/// count="N"/>`, which puts the count in the same place; both are read here.
+///
+/// The server omits the node instead of sending a zero, so `None` means "no
+/// counter" and does not collapse with a count of zero.
+pub(crate) fn parse_count_child(node: &NodeRef<'_>, tag: &str) -> Option<u64> {
+    node.get_optional_child(tag)?.attrs().optional_u64("count")
+}
+
 // Node response parsing helpers
 
 /// Parse the IQ response for newsletter message history.
 ///
 /// Response format:
 /// ```xml
-/// <messages jid="NL_JID" t="TS">
-///   <message id="..." server_id="123" t="TS" type="text" [is_sender="true"]>
-///     <plaintext>...</plaintext>
+/// <messages jid="NL_JID">
+///   <message id="..." server_id="123" t="TS" type="media" [edit="3"|"8"] [is_sender="true"]>
+///     <forwards_count count="12"/>
+///     <rcat>…opaque bytes…</rcat>
+///     <meta original_msg_t="TS" msg_edit_t="TS_MILLIS" [polltype="creation"]
+///           [contenttype="…"] [questiontype="…"] [is_wamo_sub="true"]
+///           [message_association_type="…"]>
+///       <admin_profile id="…"><name>…</name><picture id="…" direct_path="…"/></admin_profile>
+///     </meta>
+///     <votes><vote count="7">…32-byte option hash…</vote></votes>
 ///     <reactions><reaction code="👍" count="3"/></reactions>
+///     <plaintext mediatype="image">…protobuf…</plaintext>
 ///   </message>
 /// </messages>
 /// ```
+///
+/// That child set is closed, and it is what the official parser reads. An
+/// earlier version of this function read only `<plaintext>` and `<reactions>`
+/// because this comment listed only those two, which is how the counters and
+/// the poll tallies went missing for as long as they did: the comment was the
+/// spec, and it was wrong. Keep it matched to the wire.
+///
+/// A `<meta>` node appears at most once, in one of two mutually exclusive
+/// shapes: attributes, or a single `<admin_profile>` child. Reading it by
+/// attribute alone silently drops the profile.
 ///
 /// Deliberately lenient where WA Web discriminates: the bundle gates message
 /// subtypes on `<plaintext>` / `<reaction>` presence, but this parser flattens
@@ -966,35 +1147,138 @@ fn parse_newsletter_messages_response(
             .map(|s| NewsletterMessageType::from(s.as_ref()))
             .unwrap_or(NewsletterMessageType::Text);
 
+        let edit = msg_node
+            .get_attr("edit")
+            .map(|v| EditAttribute::from(v.as_str().as_ref()))
+            .unwrap_or(EditAttribute::Empty);
+
         let is_sender = msg_node
             .get_attr("is_sender")
             .is_some_and(|v| v.as_str() == "true");
 
-        // Decode <plaintext> protobuf bytes
-        let message =
-            msg_node
-                .get_optional_child("plaintext")
-                .and_then(|pt| match pt.content.as_ref() {
-                    Some(NodeContentRef::Bytes(bytes)) => {
-                        waproto::codec::message_decode(bytes.as_ref()).ok()
-                    }
-                    _ => None,
-                });
+        let plaintext = msg_node.get_optional_child("plaintext");
+
+        // Decode <plaintext> protobuf bytes. A revocation carries an empty
+        // `<plaintext/>`, which lands here as no content and stays `None`.
+        let message = plaintext.and_then(|pt| match pt.content.as_ref() {
+            Some(NodeContentRef::Bytes(bytes)) => {
+                waproto::codec::message_decode(bytes.as_ref()).ok()
+            }
+            _ => None,
+        });
+
+        let media_type = plaintext
+            .and_then(|pt| pt.get_attr("mediatype"))
+            .map(|v| v.as_str().into_owned());
 
         let reactions = parse_reaction_counts(msg_node);
+        let votes = parse_poll_votes(msg_node);
+
+        let meta = parse_message_meta(msg_node, &message_type);
 
         result.push(NewsletterMessage {
             message_id,
             server_id,
             timestamp,
             message_type,
+            edit,
             is_sender,
             message,
+            media_type,
             reactions,
+            votes,
+            forwards_count: parse_count_child(msg_node, "forwards_count"),
+            views_count: parse_count_child(msg_node, "views_count"),
+            responses_count: parse_count_child(msg_node, "responses_count"),
+            original_timestamp: meta.original_timestamp,
+            last_edit_timestamp_ms: meta.last_edit_timestamp_ms,
+            poll_type: meta.poll_type,
+            content_type: meta.content_type,
+            question_type: meta.question_type,
+            message_association_type: meta.message_association_type,
+            is_wamo_sub: meta.is_wamo_sub,
+            admin_profile: meta.admin_profile,
+            rcat: msg_node
+                .get_optional_child("rcat")
+                .and_then(|n| n.content_bytes())
+                .map(<[u8]>::to_vec),
         });
     }
 
     Ok(result)
+}
+
+/// The `<meta>` child of a newsletter `<message>`, flattened.
+///
+/// Mirrors how `MessageInfo` treats `<meta>` for ordinary messages: the
+/// attributes belong to the message, not to a nested object the caller has to
+/// unwrap twice.
+#[derive(Default)]
+struct MessageMeta {
+    original_timestamp: Option<u64>,
+    last_edit_timestamp_ms: Option<u64>,
+    poll_type: Option<PollType>,
+    content_type: Option<String>,
+    question_type: Option<String>,
+    message_association_type: Option<String>,
+    is_wamo_sub: bool,
+    admin_profile: Option<NewsletterAdminProfile>,
+}
+
+fn parse_message_meta(msg_node: &NodeRef<'_>, message_type: &NewsletterMessageType) -> MessageMeta {
+    let Some(meta_node) = msg_node.get_optional_child("meta") else {
+        return MessageMeta::default();
+    };
+    let mut attrs = meta_node.attrs();
+
+    MessageMeta {
+        // Seconds, while `msg_edit_t` right below is milliseconds. The two
+        // units sit in the same node; do not unify them.
+        original_timestamp: attrs.optional_u64("original_msg_t"),
+        last_edit_timestamp_ms: attrs.optional_u64("msg_edit_t"),
+        // WA Web scopes `polltype` to poll envelopes, so a value on any other
+        // type is not the poll stage and is not recorded as one.
+        poll_type: if *message_type == NewsletterMessageType::Poll {
+            attrs
+                .optional_string("polltype")
+                .and_then(|s| PollType::try_from(s.as_ref()).ok())
+        } else {
+            None
+        },
+        content_type: attrs.optional_string("contenttype").map(|s| s.into_owned()),
+        question_type: attrs
+            .optional_string("questiontype")
+            .map(|s| s.into_owned()),
+        message_association_type: attrs
+            .optional_string("message_association_type")
+            .map(|s| s.into_owned()),
+        is_wamo_sub: attrs
+            .optional_string("is_wamo_sub")
+            .is_some_and(|s| s == "true"),
+        admin_profile: meta_node
+            .get_optional_child("admin_profile")
+            .map(parse_admin_profile_node),
+    }
+}
+
+/// `<admin_profile id="…"><name>…</name><picture id="…" direct_path="…"/></admin_profile>`,
+/// the node form of the profile the MEX responses deliver as JSON.
+fn parse_admin_profile_node(node: &NodeRef<'_>) -> NewsletterAdminProfile {
+    let picture = node.get_optional_child("picture");
+    NewsletterAdminProfile {
+        id: node.get_attr("id").map(|v| v.as_str().into_owned()),
+        name: node
+            .get_optional_child("name")
+            .and_then(|n| n.content_as_string())
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        picture_id: picture
+            .and_then(|p| p.get_attr("id"))
+            .map(|v| v.as_str().into_owned()),
+        picture_direct_path: picture
+            .and_then(|p| p.get_attr("direct_path"))
+            .map(|v| v.as_str().into_owned()),
+    }
 }
 
 /// Build the MEX variables for `update_newsletter_user_setting`. WA Web
@@ -1585,5 +1869,300 @@ mod tests {
 
         let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
         assert_eq!(msgs[0].message_type, NewsletterMessageType::Media);
+    }
+
+    /// Wrap message nodes in the `<iq><messages>` envelope the server answers
+    /// a history request with.
+    fn history_response(messages: Vec<wacore_binary::Node>) -> wacore_binary::Node {
+        NodeBuilder::new("iq")
+            .children([NodeBuilder::new("messages")
+                .attr("jid", "111222333444555666@newsletter")
+                .children(messages)
+                .build()])
+            .build()
+    }
+
+    /// Every sibling of `<plaintext>` the server sends, on one message. The
+    /// parser used to read two of them and drop the rest.
+    #[test]
+    fn full_message_reads_every_child() {
+        let hash_a = wacore::poll::compute_option_hash("Option A");
+        let hash_b = wacore::poll::compute_option_hash("Option B");
+
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "907")
+                .attr("id", "FICTIONALMSGID01")
+                .attr("t", "1700000000")
+                .attr("type", "poll")
+                .children([
+                    NodeBuilder::new("forwards_count")
+                        .attr("count", "12")
+                        .build(),
+                    NodeBuilder::new("rcat").bytes(vec![0xAAu8; 155]).build(),
+                    NodeBuilder::new("meta")
+                        .attr("polltype", "creation")
+                        .attr("contenttype", "add_on")
+                        .attr("is_wamo_sub", "true")
+                        .build(),
+                    NodeBuilder::new("votes")
+                        .children([
+                            NodeBuilder::new("vote")
+                                .attr("count", "7")
+                                .bytes(hash_a.to_vec())
+                                .build(),
+                            NodeBuilder::new("vote")
+                                .attr("count", "3")
+                                .bytes(hash_b.to_vec())
+                                .build(),
+                        ])
+                        .build(),
+                    NodeBuilder::new("reactions")
+                        .children([NodeBuilder::new("reaction")
+                            .attr("code", "👍")
+                            .attr("count", "5")
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("plaintext")
+                        .attr("mediatype", "image")
+                        .bytes(Vec::new())
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        let msg = &msgs[0];
+
+        assert_eq!(msg.message_type, NewsletterMessageType::Poll);
+        assert_eq!(msg.forwards_count, Some(12));
+        assert_eq!(msg.poll_type, Some(PollType::Creation));
+        assert_eq!(msg.content_type.as_deref(), Some("add_on"));
+        assert!(msg.is_wamo_sub);
+        assert_eq!(msg.media_type.as_deref(), Some("image"));
+        assert_eq!(msg.rcat.as_ref().map(Vec::len), Some(155));
+        assert_eq!(
+            msg.votes,
+            vec![
+                NewsletterPollVote {
+                    option_hash: hash_a,
+                    count: 7,
+                },
+                NewsletterPollVote {
+                    option_hash: hash_b,
+                    count: 3,
+                },
+            ]
+        );
+        assert_eq!(msg.reactions.len(), 1);
+        // Not sent by the server for a plain follower; absence must not
+        // collapse into a count of zero.
+        assert_eq!(msg.views_count, None);
+        assert_eq!(msg.responses_count, None);
+    }
+
+    /// A message with none of the optional children still parses, and every
+    /// counter reads as absent rather than as zero.
+    #[test]
+    fn bare_message_leaves_every_counter_absent() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "1")
+                .attr("id", "FICTIONALMSGID02")
+                .attr("t", "1700000000")
+                .attr("type", "text")
+                .children([NodeBuilder::new("plaintext").bytes(Vec::new()).build()])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+
+        assert_eq!(msg.forwards_count, None);
+        assert_eq!(msg.views_count, None);
+        assert_eq!(msg.responses_count, None);
+        assert_eq!(msg.edit, EditAttribute::Empty);
+        assert!(msg.votes.is_empty());
+        assert!(msg.reactions.is_empty());
+        assert_eq!(msg.poll_type, None);
+        assert!(msg.admin_profile.is_none());
+        assert!(msg.rcat.is_none());
+        assert!(msg.media_type.is_none());
+    }
+
+    /// The two `<meta>` shapes are mutually exclusive: attributes, or a single
+    /// `<admin_profile>` child. Reading the node by attribute alone drops the
+    /// profile silently.
+    #[test]
+    fn meta_carries_either_attributes_or_an_admin_profile() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "2")
+                .attr("t", "1700000000")
+                .attr("type", "media")
+                .children([
+                    NodeBuilder::new("meta")
+                        .children([NodeBuilder::new("admin_profile")
+                            .attr("id", "fictional-profile-id")
+                            .children([
+                                NodeBuilder::new("name")
+                                    .bytes(b"Fictional Admin".to_vec())
+                                    .build(),
+                                NodeBuilder::new("picture")
+                                    .attr("id", "1")
+                                    .attr("direct_path", "/v/t61.0-24/fictional.enc")
+                                    .build(),
+                            ])
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
+                ])
+                .build(),
+            NodeBuilder::new("message")
+                .attr("server_id", "3")
+                .attr("t", "1700000100")
+                .attr("type", "text")
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("original_msg_t", "1700000000")
+                        .attr("msg_edit_t", "1700000100000")
+                        .build(),
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
+                ])
+                .build(),
+        ]);
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+
+        let profile = msgs[0].admin_profile.as_ref().expect("admin profile");
+        assert_eq!(profile.name, "Fictional Admin");
+        assert_eq!(profile.id.as_deref(), Some("fictional-profile-id"));
+        assert_eq!(
+            profile.picture_direct_path.as_deref(),
+            Some("/v/t61.0-24/fictional.enc")
+        );
+        assert_eq!(msgs[0].original_timestamp, None);
+
+        // Seconds and milliseconds, side by side in one node.
+        assert_eq!(msgs[1].original_timestamp, Some(1_700_000_000));
+        assert_eq!(msgs[1].last_edit_timestamp_ms, Some(1_700_000_100_000));
+        assert!(msgs[1].admin_profile.is_none());
+    }
+
+    /// A revocation keeps the envelope and loses the body: `edit="8"`, no
+    /// forward counter, an empty `<plaintext/>`.
+    #[test]
+    fn revoked_message_parses_with_no_payload() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "4")
+                .attr("id", "FICTIONALMSGID03")
+                .attr("t", "1700000200")
+                .attr("type", "text")
+                .attr("edit", "8")
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("original_msg_t", "1700000000")
+                        .build(),
+                    NodeBuilder::new("plaintext").build(),
+                ])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+
+        assert_eq!(msg.edit, EditAttribute::AdminRevoke);
+        assert!(msg.message.is_none());
+        assert_eq!(msg.forwards_count, None);
+        assert_eq!(msg.original_timestamp, Some(1_700_000_000));
+    }
+
+    /// An edit is an attribute, not a message type.
+    #[test]
+    fn edited_message_keeps_its_content_type() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "5")
+                .attr("t", "1700000300")
+                .attr("type", "media")
+                .attr("edit", "3")
+                .children([NodeBuilder::new("plaintext")
+                    .attr("mediatype", "video")
+                    .bytes(Vec::new())
+                    .build()])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+
+        assert_eq!(msg.edit, EditAttribute::AdminEdit);
+        assert_eq!(msg.message_type, NewsletterMessageType::Media);
+        assert_eq!(msg.media_type.as_deref(), Some("video"));
+    }
+
+    /// `polltype` is scoped to poll envelopes, the same way WA Web scopes it
+    /// for ordinary messages.
+    #[test]
+    fn polltype_is_ignored_off_a_poll_message() {
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "6")
+                .attr("t", "1700000400")
+                .attr("type", "text")
+                .children([NodeBuilder::new("meta")
+                    .attr("polltype", "creation")
+                    .build()])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+        assert_eq!(msg.poll_type, None);
+    }
+
+    /// A `<vote>` whose content is not a 32-byte digest is dropped: a
+    /// truncated hash would attribute the tally to the wrong option.
+    #[test]
+    fn vote_with_a_malformed_hash_is_dropped() {
+        let good = wacore::poll::compute_option_hash("Yes");
+        let response = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", "7")
+                .attr("t", "1700000500")
+                .attr("type", "poll")
+                .children([NodeBuilder::new("votes")
+                    .children([
+                        NodeBuilder::new("vote")
+                            .attr("count", "2")
+                            .bytes(vec![0x01, 0x02, 0x03])
+                            .build(),
+                        NodeBuilder::new("vote")
+                            .attr("count", "9")
+                            .bytes(good.to_vec())
+                            .build(),
+                    ])
+                    .build()])
+                .build(),
+        ]);
+
+        let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
+        assert_eq!(
+            msg.votes,
+            vec![NewsletterPollVote {
+                option_hash: good,
+                count: 9,
+            }]
+        );
+    }
+
+    /// An empty channel answers `<messages jid="…"/>` with no children at all.
+    #[test]
+    fn empty_messages_node_yields_no_messages() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("messages")
+                .attr("jid", "111222333444555666@newsletter")
+                .build()])
+            .build();
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert!(msgs.is_empty());
     }
 }
