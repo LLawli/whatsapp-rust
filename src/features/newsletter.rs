@@ -69,10 +69,9 @@ impl NewsletterError {
 /// The `type` attribute of a `<message>` in a newsletter's history.
 ///
 /// Only [`Text`](Self::Text), [`Media`](Self::Media) and [`Poll`](Self::Poll)
-/// occur on the wire: WA Web's history parser discriminates on those three,
-/// and a capture of 267 history messages across 9 channels carried nothing
-/// else. What the other variants try to name lives in sibling fields instead,
-/// and matching on them will never fire:
+/// are the history wire values confirmed by both the pinned and latest
+/// whatspec IR. What the other variants try to name lives in sibling fields
+/// instead, and matching on them will never fire:
 ///
 /// - an edit is `edit="3"` and a revocation `edit="8"`, both read into
 ///   [`NewsletterMessage::edit`];
@@ -112,6 +111,98 @@ pub enum NewsletterMessageType {
     /// Never produced by the wire; an edit is `edit="3"`.
     #[wire = "edit"]
     Edit,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// The `mediatype` attribute of newsletter `<plaintext>`.
+///
+/// The known values come from the history IQ shape. `Other` keeps this API
+/// forward-compatible if WhatsApp adds another media kind.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
+pub enum NewsletterMediaType {
+    #[wire = "1p_sticker"]
+    OnePSticker,
+    #[wire = "audio"]
+    Audio,
+    #[wire = "avatar_sticker"]
+    AvatarSticker,
+    #[wire = "cataloglink"]
+    CatalogLink,
+    #[wire = "collection"]
+    Collection,
+    #[wire = "document"]
+    Document,
+    #[wire = "genai_sticker"]
+    GenAiSticker,
+    #[wire = "gif"]
+    Gif,
+    #[wire = "image"]
+    Image,
+    #[wire = "motion_photo"]
+    MotionPhoto,
+    #[wire = "motion_video"]
+    MotionVideo,
+    #[wire = "productlink"]
+    ProductLink,
+    #[wire = "ptt"]
+    Ptt,
+    #[wire = "ptv"]
+    Ptv,
+    #[wire = "sticker"]
+    Sticker,
+    #[wire = "sticker_pack"]
+    StickerPack,
+    #[wire = "url"]
+    Url,
+    #[wire = "user_created_sticker"]
+    UserCreatedSticker,
+    #[wire = "vcard"]
+    Vcard,
+    #[wire = "video"]
+    Video,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// The `message_association_type` attribute in newsletter `<meta>`.
+///
+/// Unknown values are retained in `Other` instead of rejected, because this
+/// attribute is a closed set in the current IR but can grow with new media
+/// relationships.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
+pub enum NewsletterMessageAssociationType {
+    #[wire = "hd_image_dual_upload"]
+    HdImageDualUpload,
+    #[wire = "hd_video_dual_upload"]
+    HdVideoDualUpload,
+    #[wire = "hevc_video_dual_upload"]
+    HevcVideoDualUpload,
+    #[wire = "media_poll"]
+    MediaPoll,
+    #[wire = "motion_photo"]
+    MotionPhoto,
+    #[wire = "poll_add_option"]
+    PollAddOption,
+    #[wire = "sticker_annotation"]
+    StickerAnnotation,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// The `questiontype` attribute in newsletter `<meta>`.
+///
+/// This small closed set is kept forward-compatible for future question
+/// variants.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
+pub enum NewsletterQuestionType {
+    #[wire = "question"]
+    Question,
+    #[wire = "reply"]
+    Reply,
     #[wire_fallback]
     Other(String),
 }
@@ -258,13 +349,10 @@ pub struct NewsletterMessage {
     /// Decoded protobuf message (from `<plaintext>` bytes). `None` when the
     /// server sent no body, as it does for a revocation.
     pub message: Option<wa::Message>,
-    /// The `mediatype` attribute of `<plaintext>` — `image`, `video`, `gif`,
-    /// `url` and so on. A hint about the payload that is readable without
-    /// decoding it.
-    ///
-    /// Left untyped on purpose: the bundle names this enum synthetically, so
-    /// the codegen does not bind it and a hand-written twin would drift.
-    pub media_type: Option<String>,
+    /// The `mediatype` attribute of `<plaintext>`, a hint about the payload
+    /// that is readable without decoding it. Unknown values are retained as
+    /// [`NewsletterMediaType::Other`].
+    pub media_type: Option<NewsletterMediaType>,
     /// Reaction counts on this message.
     pub reactions: Vec<NewsletterReactionCount>,
     /// Per-option vote tallies, for a `poll` message.
@@ -301,19 +389,21 @@ pub struct NewsletterMessage {
     /// `<meta contenttype>`.
     pub content_type: Option<String>,
     /// `<meta questiontype>`: `question` for a channel question, `reply` for an
-    /// admin's reply to one.
-    pub question_type: Option<String>,
+    /// admin's reply to one. Unknown values are retained as `Other`.
+    pub question_type: Option<NewsletterQuestionType>,
     /// `<meta message_association_type>`: how this media relates to another
-    /// message (`media_poll`, `motion_photo`, `poll_add_option`, …).
-    pub message_association_type: Option<String>,
+    /// message (`media_poll`, `motion_photo`, `poll_add_option`, …). Unknown
+    /// values are retained as `Other`.
+    pub message_association_type: Option<NewsletterMessageAssociationType>,
     /// `<meta is_wamo_sub="true">`.
     pub is_wamo_sub: bool,
     /// `<meta><admin_profile>`: the publishing admin's public profile, on
     /// channels that enabled admin profiles.
     pub admin_profile: Option<NewsletterAdminProfile>,
-    /// `<rcat>` content bytes, an opaque receiver-side token the server
-    /// attaches to some link previews (`mediatype="url"`). Carried verbatim;
-    /// this client does not interpret it.
+    /// `<rcat>` content bytes, an opaque receiver-side token. WA Web
+    /// associates it with `type="media"` and `mediatype="url"` link
+    /// previews; this parser intentionally accepts it on any message for
+    /// forward compatibility and carries it verbatim without interpreting it.
     pub rcat: Option<Vec<u8>>,
 }
 
@@ -686,11 +776,13 @@ impl<'a> Newsletter<'a> {
 
     // ─── Live updates ───────────────────────────────────────────────────
 
-    /// Subscribe to live updates for a newsletter: reaction counts, forward
-    /// counts and poll tallies as they move.
+    /// Subscribe to live reaction-count updates for a newsletter.
     ///
-    /// The server will send `<notification type="newsletter">` stanzas with
-    /// `<live_updates>` children, dispatched as `Event::NewsletterLiveUpdate`.
+    /// The pinned and latest notif IR confirm the notification type and
+    /// handler, but do not expose structured `<live_updates>` fields. This API
+    /// therefore makes no claim about history counters or poll tallies in live
+    /// notifications until a sanitized capture or bundle evidence establishes
+    /// those children.
     /// Returns the subscription duration in seconds, after which it has to be
     /// renewed. The server sets this; 90 seconds is what it answered in a real
     /// session, and the 300 below is only the fallback for a response that
@@ -1029,9 +1121,11 @@ pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactio
 
 /// Parse per-option tallies from a `<votes>` node.
 ///
-/// Not gated on the message's `type`: a live update carries `<votes>` on a
-/// bare `<message server_id="…">` with no type attribute at all, so gating
-/// here would drop exactly the updates a running poll produces.
+/// Not gated on the message's `type`: history responses can carry `<votes>`
+/// on a poll envelope whose type is missing or is not yet known, so gating
+/// here would make the parser brittle as the wire grows. Live notifications
+/// are deliberately not parsed by this helper: their child shape is not
+/// established by the available notif IR evidence.
 ///
 /// A `<vote>` whose content is not a 32-byte digest is skipped rather than
 /// truncated or padded — the hash is the only handle on which option was
@@ -1048,7 +1142,11 @@ pub(crate) fn parse_poll_votes(node: &NodeRef<'_>) -> Vec<NewsletterPollVote> {
             else {
                 continue;
             };
-            let count = v.attrs().optional_u64("count").unwrap_or(0);
+            let Some(count) = v.attrs().optional_u64("count") else {
+                // `count` is required by the history contract; an absent or
+                // malformed value is not the same fact as count zero.
+                continue;
+            };
             votes.push(NewsletterPollVote { option_hash, count });
         }
     }
@@ -1089,11 +1187,14 @@ pub(crate) fn parse_count_child(node: &NodeRef<'_>, tag: &str) -> Option<u64> {
 /// </messages>
 /// ```
 ///
-/// That child set is closed, and it is what the official parser reads. An
-/// earlier version of this function read only `<plaintext>` and `<reactions>`
-/// because this comment listed only those two, which is how the counters and
-/// the poll tallies went missing for as long as they did: the comment was the
-/// spec, and it was wrong. Keep it matched to the wire.
+/// The pinned and latest IQ shapes confirm the fields modelled below. The IR
+/// also exposes paid-partnership and newsletter-AI content mixins, but it does
+/// not provide a source path or wire shape for either. Raw bundle JavaScript
+/// and a sanitized capture were not inspected for those mixins, so this
+/// parser deliberately does not claim complete parity with the official
+/// parser. An earlier version read only `<plaintext>` and `<reactions>`;
+/// keeping this comment limited to the confirmed fields prevents that gap
+/// from becoming the API's specification again.
 ///
 /// A `<meta>` node appears at most once, in one of two mutually exclusive
 /// shapes: attributes, or a single `<admin_profile>` child. Reading it by
@@ -1158,10 +1259,11 @@ fn parse_newsletter_messages_response(
 
         let plaintext = msg_node.get_optional_child("plaintext");
 
-        // Decode <plaintext> protobuf bytes. A revocation carries an empty
-        // `<plaintext/>`, which lands here as no content and stays `None`.
+        // Decode <plaintext> protobuf bytes. A revocation can carry an
+        // explicit empty `<plaintext/>`; decoding that as protobuf would
+        // produce `Message::default()`, so preserve the absent body.
         let message = plaintext.and_then(|pt| match pt.content.as_ref() {
-            Some(NodeContentRef::Bytes(bytes)) => {
+            Some(NodeContentRef::Bytes(bytes)) if !bytes.as_ref().is_empty() => {
                 waproto::codec::message_decode(bytes.as_ref()).ok()
             }
             _ => None,
@@ -1169,7 +1271,7 @@ fn parse_newsletter_messages_response(
 
         let media_type = plaintext
             .and_then(|pt| pt.get_attr("mediatype"))
-            .map(|v| v.as_str().into_owned());
+            .map(|v| NewsletterMediaType::from(v.as_str().as_ref()));
 
         let reactions = parse_reaction_counts(msg_node);
         let votes = parse_poll_votes(msg_node);
@@ -1219,8 +1321,8 @@ struct MessageMeta {
     last_edit_timestamp_ms: Option<u64>,
     poll_type: Option<PollType>,
     content_type: Option<String>,
-    question_type: Option<String>,
-    message_association_type: Option<String>,
+    question_type: Option<NewsletterQuestionType>,
+    message_association_type: Option<NewsletterMessageAssociationType>,
     is_wamo_sub: bool,
     admin_profile: Option<NewsletterAdminProfile>,
 }
@@ -1248,10 +1350,10 @@ fn parse_message_meta(msg_node: &NodeRef<'_>, message_type: &NewsletterMessageTy
         content_type: attrs.optional_string("contenttype").map(|s| s.into_owned()),
         question_type: attrs
             .optional_string("questiontype")
-            .map(|s| s.into_owned()),
+            .map(|s| NewsletterQuestionType::from(s.as_ref())),
         message_association_type: attrs
             .optional_string("message_association_type")
-            .map(|s| s.into_owned()),
+            .map(|s| NewsletterMessageAssociationType::from(s.as_ref())),
         is_wamo_sub: attrs
             .optional_string("is_wamo_sub")
             .is_some_and(|s| s == "true"),
@@ -1899,10 +2001,16 @@ mod tests {
                     NodeBuilder::new("forwards_count")
                         .attr("count", "12")
                         .build(),
+                    NodeBuilder::new("views_count").attr("count", "23").build(),
+                    NodeBuilder::new("responses_count")
+                        .attr("count", "31")
+                        .build(),
                     NodeBuilder::new("rcat").bytes(vec![0xAAu8; 155]).build(),
                     NodeBuilder::new("meta")
                         .attr("polltype", "creation")
                         .attr("contenttype", "add_on")
+                        .attr("questiontype", "question")
+                        .attr("message_association_type", "media_poll")
                         .attr("is_wamo_sub", "true")
                         .build(),
                     NodeBuilder::new("votes")
@@ -1936,10 +2044,17 @@ mod tests {
 
         assert_eq!(msg.message_type, NewsletterMessageType::Poll);
         assert_eq!(msg.forwards_count, Some(12));
+        assert_eq!(msg.views_count, Some(23));
+        assert_eq!(msg.responses_count, Some(31));
         assert_eq!(msg.poll_type, Some(PollType::Creation));
         assert_eq!(msg.content_type.as_deref(), Some("add_on"));
+        assert_eq!(msg.question_type, Some(NewsletterQuestionType::Question));
+        assert_eq!(
+            msg.message_association_type,
+            Some(NewsletterMessageAssociationType::MediaPoll)
+        );
         assert!(msg.is_wamo_sub);
-        assert_eq!(msg.media_type.as_deref(), Some("image"));
+        assert_eq!(msg.media_type, Some(NewsletterMediaType::Image));
         assert_eq!(msg.rcat.as_ref().map(Vec::len), Some(155));
         assert_eq!(
             msg.votes,
@@ -1955,10 +2070,10 @@ mod tests {
             ]
         );
         assert_eq!(msg.reactions.len(), 1);
-        // Not sent by the server for a plain follower; absence must not
-        // collapse into a count of zero.
-        assert_eq!(msg.views_count, None);
-        assert_eq!(msg.responses_count, None);
+        // Distinct values protect the three sibling mappings from swaps.
+        assert_eq!(msg.forwards_count, Some(12));
+        assert_eq!(msg.views_count, Some(23));
+        assert_eq!(msg.responses_count, Some(31));
     }
 
     /// A message with none of the optional children still parses, and every
@@ -2063,7 +2178,9 @@ mod tests {
                     NodeBuilder::new("meta")
                         .attr("original_msg_t", "1700000000")
                         .build(),
-                    NodeBuilder::new("plaintext").build(),
+                    // Explicit zero-length bytes are distinct from an
+                    // omitted body and must not decode to Message::default().
+                    NodeBuilder::new("plaintext").bytes(Vec::new()).build(),
                 ])
                 .build(),
         ]);
@@ -2096,7 +2213,7 @@ mod tests {
 
         assert_eq!(msg.edit, EditAttribute::AdminEdit);
         assert_eq!(msg.message_type, NewsletterMessageType::Media);
-        assert_eq!(msg.media_type.as_deref(), Some("video"));
+        assert_eq!(msg.media_type, Some(NewsletterMediaType::Video));
     }
 
     /// `polltype` is scoped to poll envelopes, the same way WA Web scopes it
@@ -2118,10 +2235,11 @@ mod tests {
         assert_eq!(msg.poll_type, None);
     }
 
-    /// A `<vote>` whose content is not a 32-byte digest is dropped: a
-    /// truncated hash would attribute the tally to the wrong option.
+    /// A `<vote>` whose content is not a 32-byte digest, or whose required
+    /// count is missing/malformed, is dropped rather than attributed to the
+    /// wrong option or silently changed to zero.
     #[test]
-    fn vote_with_a_malformed_hash_is_dropped() {
+    fn malformed_poll_votes_are_dropped() {
         let good = wacore::poll::compute_option_hash("Yes");
         let response = history_response(vec![
             NodeBuilder::new("message")
@@ -2133,6 +2251,11 @@ mod tests {
                         NodeBuilder::new("vote")
                             .attr("count", "2")
                             .bytes(vec![0x01, 0x02, 0x03])
+                            .build(),
+                        NodeBuilder::new("vote").bytes(good.to_vec()).build(),
+                        NodeBuilder::new("vote")
+                            .attr("count", "many")
+                            .bytes(good.to_vec())
                             .build(),
                         NodeBuilder::new("vote")
                             .attr("count", "9")
@@ -2235,7 +2358,7 @@ mod tests {
         assert_eq!(msgs[1].poll_type, Some(PollType::Creation));
         assert_eq!(msgs[1].votes.len(), 1);
 
-        assert_eq!(msgs[2].media_type.as_deref(), Some("gif"));
+        assert_eq!(msgs[2].media_type, Some(NewsletterMediaType::Gif));
         assert!(msgs[2].votes.is_empty());
         assert_eq!(msgs[2].forwards_count, None);
     }
