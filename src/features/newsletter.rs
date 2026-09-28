@@ -1206,7 +1206,9 @@ fn parse_fetched_newsletter(
     jid: &Jid,
 ) -> Result<NewsletterMetadata, NewsletterError> {
     let data = data.ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
-    let newsletter = &data["xwa2_newsletter"];
+    let newsletter = data
+        .get("xwa2_newsletter")
+        .ok_or_else(|| NewsletterError::InvalidRequest("missing xwa2_newsletter".into()))?;
     if is_absent_newsletter(newsletter) {
         return Err(NewsletterError::NotFound(jid.clone()));
     }
@@ -1951,6 +1953,11 @@ mod tests {
         fn a_missing_data_block_is_still_a_malformed_answer() {
             assert!(matches!(
                 parse_fetched_newsletter(None, &newsletter_jid()),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            // An explicit `null` is an absent channel; an omitted field is not.
+            assert!(matches!(
+                parse_fetched_newsletter(Some(json!({})), &newsletter_jid()),
                 Err(NewsletterError::InvalidRequest(_))
             ));
             assert!(matches!(
