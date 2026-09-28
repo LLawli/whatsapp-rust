@@ -80,6 +80,24 @@ pub fn message_key(
     }
 }
 
+/// Every `index[0]` `dispatch_chat_mutation_outcome` claims; a kind missing
+/// here never reaches its match arm.
+const CHAT_ACTION_KINDS: &[&str] = &[
+    "mute",
+    "pin",
+    "pin_v1",
+    "archive",
+    "star",
+    "contact",
+    "mark_chat_as_read",
+    "markChatAsRead",
+    "deleteChat",
+    "clearChat",
+    "lock",
+    "userStatusMute",
+    "deleteMessageForMe",
+];
+
 /// Dispatch inbound chat mutations, returning the [`AppStateDispatchOutcome`]
 /// for the semantic per-mutation log line. A new WhatsApp command that falls
 /// through every handler shows up as `Unclaimed` instead of vanishing
@@ -114,22 +132,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
         return AppStateDispatchOutcome::Unclaimed;
     }
 
-    if !matches!(
-        kind.as_str(),
-        "mute"
-            | "pin"
-            | "pin_v1"
-            | "archive"
-            | "star"
-            | "contact"
-            | "mark_chat_as_read"
-            | "markChatAsRead"
-            | "deleteChat"
-            | "clearChat"
-            | "lock"
-            | "userStatusMute"
-            | "deleteMessageForMe"
-    ) {
+    if !CHAT_ACTION_KINDS.contains(&kind.as_str()) {
         return AppStateDispatchOutcome::Unclaimed;
     }
 
@@ -1503,8 +1506,8 @@ mod registry_tests {
         }
     }
 
-    /// One mutation per event `dispatch_chat_mutation_outcome` emits, each
-    /// stamped with `timestamp`.
+    /// One mutation per kind `dispatch_chat_mutation_outcome` claims, plus a
+    /// contact removal, each stamped with `timestamp`.
     fn every_chat_mutation(timestamp: Option<i64>) -> Vec<Mutation> {
         use wa::sync_action_value as sav;
         const CHAT: &str = "12025550111@s.whatsapp.net";
@@ -1525,6 +1528,13 @@ mod registry_tests {
             ),
             set(
                 &["pin_v1", CHAT],
+                wa::SyncActionValue {
+                    pin_action: buffa::MessageField::some(sav::PinAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["pin", CHAT],
                 wa::SyncActionValue {
                     pin_action: buffa::MessageField::some(sav::PinAction::default()),
                     ..Default::default()
@@ -1559,6 +1569,15 @@ mod registry_tests {
             },
             set(
                 &["markChatAsRead", CHAT],
+                wa::SyncActionValue {
+                    mark_chat_as_read_action: buffa::MessageField::some(
+                        sav::MarkChatAsReadAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["mark_chat_as_read", CHAT],
                 wa::SyncActionValue {
                     mark_chat_as_read_action: buffa::MessageField::some(
                         sav::MarkChatAsReadAction::default(),
@@ -1647,8 +1666,12 @@ mod registry_tests {
                 (name, t, a)
             })
             .collect();
-        // A new chat event must join the table, or it escapes these tests.
-        assert_eq!(stamps.len(), 12);
+        // Keyed on the dispatcher's own kinds, so a kind it starts claiming
+        // fails here until the table covers it.
+        let covered: std::collections::BTreeSet<_> =
+            mutations.iter().map(|m| m.index[0].as_str()).collect();
+        let claimed: std::collections::BTreeSet<_> = CHAT_ACTION_KINDS.iter().copied().collect();
+        assert_eq!(covered, claimed);
         stamps
     }
 
