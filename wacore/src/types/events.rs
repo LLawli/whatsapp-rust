@@ -2615,8 +2615,8 @@ pub struct DeleteChatUpdate {
     /// From the index, not the proto — DeleteChatAction only has messageRange.
     pub delete_media: bool,
     /// When the mutation was made, not which messages it covers: that bound is
-    /// `action.message_range`, the only input WA Web's `WAWebDeleteChatSync`
-    /// and `WAWebClearChatSync` delete by.
+    /// `action.message_range`, and WA Web's `WAWebDeleteChatSync` deletes by it
+    /// without reading this timestamp.
     pub timestamp: DateTime<Utc>,
     /// The timestamp the mutation itself carried. `None` when it carried none,
     /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
@@ -2637,8 +2637,8 @@ pub struct ClearChatUpdate {
     /// From the index, not the proto.
     pub delete_media: bool,
     /// When the mutation was made, not which messages it covers: that bound is
-    /// `action.message_range`, the only input WA Web's `WAWebDeleteChatSync`
-    /// and `WAWebClearChatSync` delete by.
+    /// `action.message_range`. WA Web's `WAWebClearChatSync` reads the
+    /// timestamp only to keep messages starred after it.
     pub timestamp: DateTime<Utc>,
     /// The timestamp the mutation itself carried. `None` when it carried none,
     /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
